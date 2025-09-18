@@ -33,6 +33,7 @@ func TestPreemptionPolicyFromString(t *testing.T) {
 		{"DefaultString", "default", DefaultPreemptionPolicy, false},
 		{"FenceString", "fence", FencePreemptionPolicy, false},
 		{"DisabledString", "disabled", DisabledPreemptionPolicy, false},
+		{"FairShareString", "fairshare", FairSharePreemptionPolicy, false},
 		{"InvalidString", "invalid", DefaultPreemptionPolicy, true},
 	}
 	for _, tt := range tests {
@@ -56,6 +57,7 @@ func TestPreemptionPolicyToString(t *testing.T) {
 		{"DefaultString", DefaultPreemptionPolicy, "default"},
 		{"FenceString", FencePreemptionPolicy, "fence"},
 		{"DisabledString", DisabledPreemptionPolicy, "disabled"},
+		{"FairShareString", FairSharePreemptionPolicy, "fairshare"},
 	}
 	for _, tt := range tests {
 		if got := tt.policy.String(); got != tt.want {

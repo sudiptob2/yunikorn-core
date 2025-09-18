@@ -30,6 +30,7 @@ import (
 	"github.com/apache/yunikorn-core/pkg/common/resources"
 	"github.com/apache/yunikorn-core/pkg/log"
 	"github.com/apache/yunikorn-core/pkg/plugins"
+	"github.com/apache/yunikorn-core/pkg/scheduler/policies"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/api"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
 )
@@ -162,11 +163,13 @@ func (p *Preemptor) initWorkingState() {
 
 	// walk node iterator and track available resources per node
 	p.iterator.ForEachNode(func(node *Node) bool {
-		if !node.IsSchedulable() || (node.IsReserved() && !node.isReservedForAllocation(p.ask.GetAllocationKey())) || !node.FitInNode(p.ask.GetAllocatedResource()) {
+		if !node.IsSchedulable() || (node.IsReserved() && !node.isReservedForAllocation(p.ask.GetAllocationKey())) {
 			// node is not available, remove any potential victims from consideration
 			delete(allocationsByNode, node.NodeID)
 		} else {
 			// track allocated and available resources
+			// For preemption, we keep nodes even if they don't have enough space,
+			// because preemption will free up resources
 			nodeAvailableMap[node.NodeID] = node.GetAvailableResource()
 		}
 		return true
@@ -198,9 +201,43 @@ func (p *Preemptor) checkPreemptionQueueGuarantees() bool {
 	for _, snapshot := range queues {
 		for _, alloc := range snapshot.PotentialVictims {
 			snapshot.RemoveAllocation(alloc.GetAllocatedResource())
-			remaining := currentQueue.GetRemainingGuaranteedResource()
-			if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
-				return true
+
+			// Check if current queue has fair share preemption policy
+			currentQueueObj := p.queue
+			if currentQueueObj != nil && currentQueueObj.GetPreemptionPolicy() == policies.FairSharePreemptionPolicy {
+				// For fair share preemption, we need to check if preemption will help achieve fair share
+				// This means checking if the preemptor queue needs resources (is under-allocated)
+				// and the victim queue has excess resources (is over-allocated)
+				activeSiblings := currentQueueObj.getActiveSiblingCount()
+				siblingsGuaranteedSum := currentQueueObj.getActiveSiblingsGuaranteedSum()
+				fairShare := currentQueue.GetFairShareResourceWithSiblingCountAndGuaranteedSum(activeSiblings, siblingsGuaranteedSum)
+
+				// For fair share preemption, check if there are remaining fair share resources
+				// Similar to guaranteed resources, we check if the queue has room within its fair share
+				if fairShare != nil && !fairShare.IsEmpty() {
+					actual := resources.SubOnlyExisting(currentQueue.AllocatedResource, currentQueue.PreemptingResource)
+					remaining := resources.SubOnlyExisting(fairShare, actual)
+					if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
+						log.Log(log.SchedPreemption).Info("checkPreemptionQueueGuarantees: fair share preemption has remaining fair share resources",
+							zap.String("queuePath", p.queuePath),
+							zap.Stringer("actual", actual),
+							zap.Stringer("fairShare", fairShare),
+							zap.Stringer("remaining", remaining))
+						return true
+					} else {
+						log.Log(log.SchedPreemption).Info("checkPreemptionQueueGuarantees: fair share preemption has no remaining fair share resources",
+							zap.String("queuePath", p.queuePath),
+							zap.Stringer("actual", actual),
+							zap.Stringer("fairShare", fairShare),
+							zap.Stringer("remaining", remaining))
+					}
+				}
+			} else {
+				// For guaranteed-based preemption, use existing logic
+				remaining := currentQueue.GetRemainingGuaranteedResource()
+				if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
+					return true
+				}
 			}
 		}
 	}
@@ -520,17 +557,34 @@ func (p *Preemptor) calculateAdditionalVictims(nodeVictims []*Allocation) ([]*Al
 // tryNodes attempts to find potential nodes for scheduling. For each node, potential victims are passed to
 // the shim for evaluation, and the best solution found will be returned.
 func (p *Preemptor) tryNodes() (string, []*Allocation, bool) {
+	log.Log(log.SchedPreemption).Info("tryNodes: starting node iteration",
+		zap.String("queuePath", p.queuePath),
+		zap.Int("nodeCount", len(p.nodeAvailableMap)))
+
 	// calculate victim list for each node
 	predicateChecks := make([]*si.PreemptionPredicatesArgs, 0)
 	victimsByNode := make(map[string][]*Allocation)
 	for nodeID, nodeAvailable := range p.nodeAvailableMap {
+		log.Log(log.SchedPreemption).Info("tryNodes: processing node",
+			zap.String("queuePath", p.queuePath),
+			zap.String("nodeID", nodeID),
+			zap.Stringer("nodeAvailable", nodeAvailable))
 		allocations, ok := p.allocationsByNode[nodeID]
 		if !ok {
 			// no allocations present, but node may still be available for scheduling
 			allocations = make([]*Allocation, 0)
 		}
+
+		log.Log(log.SchedPreemption).Info("tryNodes: found allocations on node",
+			zap.String("queuePath", p.queuePath),
+			zap.String("nodeID", nodeID),
+			zap.Int("allocationCount", len(allocations)))
 		// identify which victims and in which order should be tried
 		if idx, victims := p.calculateVictimsByNode(nodeAvailable, allocations); victims != nil {
+			log.Log(log.SchedPreemption).Info("tryNodes: calculateVictimsByNode found victims",
+				zap.String("queuePath", p.queuePath),
+				zap.String("nodeID", nodeID),
+				zap.Int("victimCount", len(victims)))
 			victimsByNode[nodeID] = victims
 			keys := make([]string, 0)
 			for _, victim := range victims {
@@ -545,6 +599,10 @@ func (p *Preemptor) tryNodes() (string, []*Allocation, bool) {
 					StartIndex:            int32(idx), //nolint: gosec
 				})
 			}
+		} else {
+			log.Log(log.SchedPreemption).Info("tryNodes: calculateVictimsByNode found no victims",
+				zap.String("queuePath", p.queuePath),
+				zap.String("nodeID", nodeID))
 		}
 	}
 	// call predicates to evaluate each node
@@ -556,11 +614,22 @@ func (p *Preemptor) tryNodes() (string, []*Allocation, bool) {
 }
 
 func (p *Preemptor) TryPreemption() (*AllocationResult, bool) {
+	log.Log(log.SchedPreemption).Info("TryPreemption: starting preemption attempt",
+		zap.String("queuePath", p.queuePath),
+		zap.String("askKey", p.ask.GetAllocationKey()))
+
 	// validate that sufficient capacity can be freed
 	if !p.checkPreemptionQueueGuarantees() {
+		log.Log(log.SchedPreemption).Info("TryPreemption: queue guarantees check failed",
+			zap.String("queuePath", p.queuePath),
+			zap.String("askKey", p.ask.GetAllocationKey()))
 		p.ask.LogAllocationFailure(common.PreemptionDoesNotGuarantee, true)
 		return nil, false
 	}
+
+	log.Log(log.SchedPreemption).Info("TryPreemption: queue guarantees check passed",
+		zap.String("queuePath", p.queuePath),
+		zap.String("askKey", p.ask.GetAllocationKey()))
 
 	// ensure required data structures are populated
 	p.initWorkingState()
@@ -568,20 +637,40 @@ func (p *Preemptor) TryPreemption() (*AllocationResult, bool) {
 	// try to find a node to schedule on and victims to preempt
 	nodeID, victims, ok := p.tryNodes()
 	if !ok {
+		log.Log(log.SchedPreemption).Info("TryPreemption: tryNodes failed",
+			zap.String("queuePath", p.queuePath),
+			zap.String("askKey", p.ask.GetAllocationKey()))
 		// no preemption possible
 		return nil, false
 	}
 
+	log.Log(log.SchedPreemption).Info("TryPreemption: tryNodes succeeded",
+		zap.String("queuePath", p.queuePath),
+		zap.String("askKey", p.ask.GetAllocationKey()),
+		zap.String("nodeID", nodeID),
+		zap.Int("victimCount", len(victims)))
+
 	// look for additional victims in case we have not yet made enough capacity in the queue
 	extraVictims, ok := p.calculateAdditionalVictims(victims)
 	if !ok {
+		log.Log(log.SchedPreemption).Info("TryPreemption: calculateAdditionalVictims failed",
+			zap.String("queuePath", p.queuePath),
+			zap.String("askKey", p.ask.GetAllocationKey()))
 		// not enough resources were preempted
 		return nil, false
 	}
 	victims = append(victims, extraVictims...)
 	if len(victims) == 0 {
+		log.Log(log.SchedPreemption).Info("TryPreemption: no victims after additional calculation",
+			zap.String("queuePath", p.queuePath),
+			zap.String("askKey", p.ask.GetAllocationKey()))
 		return nil, false
 	}
+
+	log.Log(log.SchedPreemption).Info("TryPreemption: proceeding with preemption",
+		zap.String("queuePath", p.queuePath),
+		zap.String("askKey", p.ask.GetAllocationKey()),
+		zap.Int("totalVictims", len(victims)))
 
 	// Did victims collected so far fulfill the ask need? In case of any shortfall between the ask resource requirement
 	// and total victims resources, preemption won't help even though victims has been collected.
@@ -619,6 +708,11 @@ func (p *Preemptor) TryPreemption() (*AllocationResult, bool) {
 		p.ask.LogAllocationFailure(common.PreemptionShortfall, true)
 		return nil, false
 	}
+
+	log.Log(log.SchedPreemption).Info("TryPreemption: starting actual preemption",
+		zap.String("queuePath", p.queuePath),
+		zap.String("askKey", p.ask.GetAllocationKey()),
+		zap.Int("finalVictimsCount", len(finalVictims)))
 
 	// preempt the victims
 	for _, victim := range finalVictims {
@@ -809,6 +903,111 @@ func (qps *QueuePreemptionSnapshot) GetPreemptableResource() *resources.Resource
 	return resources.ComponentWiseMinOnlyExisting(preemptableResource, parentPreemptableResource)
 }
 
+// GetPreemptableResourceForPolicy returns preemptable resources based on the specified preemption policy
+func (qps *QueuePreemptionSnapshot) GetPreemptableResourceForPolicy(policy policies.PreemptionPolicy) *resources.Resource {
+	if qps == nil || qps.AllocatedResource.IsEmpty() {
+		return nil
+	}
+
+	log.Log(log.SchedPreemption).Info("GetPreemptableResourceForPolicy: calculating preemptable resources",
+		zap.String("queuePath", qps.QueuePath),
+		zap.String("policy", policy.String()),
+		zap.Stringer("allocatedResource", qps.AllocatedResource))
+
+	var result *resources.Resource
+	switch policy {
+	case policies.FairSharePreemptionPolicy:
+		log.Log(log.SchedPreemption).Info("GetPreemptableResourceForPolicy: using FairSharePreemptionPolicy",
+			zap.String("queuePath", qps.QueuePath))
+		result = qps.GetFairSharePreemptableResource()
+	default:
+		// For all other policies, use the standard preemptable resource calculation
+		log.Log(log.SchedPreemption).Info("GetPreemptableResourceForPolicy: using standard preemption policy",
+			zap.String("queuePath", qps.QueuePath),
+			zap.String("policy", policy.String()))
+		result = qps.GetPreemptableResource()
+	}
+
+	log.Log(log.SchedPreemption).Info("GetPreemptableResourceForPolicy: calculated result",
+		zap.String("queuePath", qps.QueuePath),
+		zap.String("policy", policy.String()),
+		zap.Stringer("result", result))
+
+	return result
+}
+
+// GetPreemptableResourceForFairShare returns preemptable resources for fair share preemption with explicit sibling count
+func (qps *QueuePreemptionSnapshot) GetPreemptableResourceForFairShare(activeSiblings int) *resources.Resource {
+	return qps.GetPreemptableResourceForFairShareWithGuaranteedSum(activeSiblings, nil)
+}
+
+// GetPreemptableResourceForFairShareWithGuaranteedSum returns preemptable resources for fair share preemption with explicit sibling count and guaranteed sum
+func (qps *QueuePreemptionSnapshot) GetPreemptableResourceForFairShareWithGuaranteedSum(activeSiblings int, siblingsGuaranteedSum *resources.Resource) *resources.Resource {
+	if qps == nil || qps.AllocatedResource.IsEmpty() {
+		log.Log(log.SchedPreemption).Info("GetPreemptableResourceForFairShare: queue is nil or has no allocated resources",
+			zap.String("queuePath", qps.QueuePath))
+		return nil
+	}
+
+	actual := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
+
+	// Get the higher of guaranteed or fair share as the minimum threshold
+	guaranteed := qps.GuaranteedResource
+	fairShare := qps.GetFairShareResourceWithSiblingCountAndGuaranteedSum(activeSiblings, siblingsGuaranteedSum)
+
+	log.Log(log.SchedPreemption).Info("GetPreemptableResourceForFairShare: calculating preemptable resources",
+		zap.String("queuePath", qps.QueuePath),
+		zap.Int("activeSiblings", activeSiblings),
+		zap.Stringer("allocatedResource", qps.AllocatedResource),
+		zap.Stringer("preemptingResource", qps.PreemptingResource),
+		zap.Stringer("actual", actual),
+		zap.Stringer("guaranteed", guaranteed),
+		zap.Stringer("fairShare", fairShare))
+
+	var minThreshold *resources.Resource
+	if guaranteed != nil && !guaranteed.IsEmpty() {
+		minThreshold = guaranteed.Clone()
+		if fairShare != nil && !fairShare.IsEmpty() {
+			// Use the higher of guaranteed and fair share
+			for resourceType, quantity := range fairShare.Resources {
+				if existing, exists := minThreshold.Resources[resourceType]; !exists || quantity > existing {
+					minThreshold.Resources[resourceType] = quantity
+				}
+			}
+		}
+	} else if fairShare != nil && !fairShare.IsEmpty() {
+		minThreshold = fairShare.Clone()
+	} else {
+		// No minimum threshold, nothing to preempt
+		log.Log(log.SchedPreemption).Info("GetPreemptableResourceForFairShare: no minimum threshold (no guaranteed or fair share)",
+			zap.String("queuePath", qps.QueuePath))
+		return nil
+	}
+
+	// Calculate preemptable resource: allocated - min(guaranteed, fair_share)
+	preemptableResource := resources.SubOnlyExisting(actual, minThreshold)
+
+	// Keep only over-allocated resource types
+	for k, v := range preemptableResource.Resources {
+		if v <= 0 {
+			delete(preemptableResource.Resources, k)
+		}
+	}
+
+	log.Log(log.SchedPreemption).Info("GetPreemptableResourceForFairShare: calculated preemptable resources",
+		zap.String("queuePath", qps.QueuePath),
+		zap.Stringer("minThreshold", minThreshold),
+		zap.Stringer("preemptableResource", preemptableResource))
+
+	// Note: The remaining guaranteed resource check from the original preemption logic
+	// is handled at a higher level in the preemption flow (in checkPreemptionQueueGuarantees
+	// and during victim selection). The fair share preemption logic focuses on calculating
+	// what resources can be preempted based on fair share thresholds, while the remaining
+	// guaranteed resource validation is performed by the calling preemption logic.
+
+	return preemptableResource
+}
+
 func (qps *QueuePreemptionSnapshot) GetRemainingGuaranteedResource() *resources.Resource {
 	if qps == nil {
 		return nil
@@ -860,6 +1059,162 @@ func (qps *QueuePreemptionSnapshot) GetMaxResource() *resources.Resource {
 		return resources.NewResource()
 	}
 	return resources.ComponentWiseMin(qps.Parent.GetMaxResource(), qps.MaxResource)
+}
+
+// GetFairShareResource computes the fair share of resources for this queue based on parent capacity
+// and number of active sibling queues. Returns nil if fair share calculation is not applicable.
+func (qps *QueuePreemptionSnapshot) GetFairShareResource() *resources.Resource {
+	return qps.GetFairShareResourceWithSiblingCount(0) // 0 means calculate automatically
+}
+
+// GetFairShareResourceWithSiblingCount computes the fair share with explicit sibling count
+func (qps *QueuePreemptionSnapshot) GetFairShareResourceWithSiblingCount(activeSiblings int) *resources.Resource {
+	return qps.GetFairShareResourceWithSiblingCountAndGuaranteedSum(activeSiblings, nil)
+}
+
+// GetFairShareResourceWithSiblingCountAndGuaranteedSum computes the fair share with explicit sibling count and guaranteed sum
+func (qps *QueuePreemptionSnapshot) GetFairShareResourceWithSiblingCountAndGuaranteedSum(activeSiblings int, siblingsGuaranteedSum *resources.Resource) *resources.Resource {
+	if qps == nil || qps.Parent == nil {
+		return nil
+	}
+
+	// Get parent's available capacity (max - sum of children's guaranteed)
+	parentMax := qps.Parent.GetMaxResource()
+	if parentMax == nil || parentMax.IsEmpty() {
+		return nil
+	}
+
+	// Use provided siblings guaranteed sum or fall back to parent's guaranteed
+	var childrenGuaranteedSum *resources.Resource
+	if siblingsGuaranteedSum != nil && !siblingsGuaranteedSum.IsEmpty() {
+		childrenGuaranteedSum = siblingsGuaranteedSum
+	} else {
+		childrenGuaranteedSum = qps.getActiveSiblingsGuaranteedSum()
+	}
+
+	parentCapacity := resources.SubOnlyExisting(parentMax, childrenGuaranteedSum)
+	if parentCapacity == nil || parentCapacity.IsEmpty() {
+		return nil
+	}
+
+	// If sibling count not provided, try to calculate it
+	if activeSiblings == 0 {
+		activeSiblings = qps.getActiveSiblingCount()
+	}
+
+	if activeSiblings <= 1 {
+		return nil // No fair share needed if only one active queue
+	}
+
+	// Calculate fair share: parent_capacity / active_siblings
+	fairShare := parentCapacity.Clone()
+	for resourceType, quantity := range fairShare.Resources {
+		if quantity > 0 {
+			fairShare.Resources[resourceType] = quantity / resources.Quantity(activeSiblings)
+		}
+	}
+
+	// Cap fair share to the child's max resources to respect queue limits
+	childMax := qps.GetMaxResource()
+	if childMax != nil && !childMax.IsEmpty() {
+		fairShare = resources.ComponentWiseMin(fairShare, childMax)
+	}
+
+	log.Log(log.SchedPreemption).Info("GetFairShareResourceWithSiblingCount: calculated fair share",
+		zap.String("queuePath", qps.QueuePath),
+		zap.String("parentPath", qps.Parent.QueuePath),
+		zap.Int("activeSiblings", activeSiblings),
+		zap.Stringer("parentCapacity", parentCapacity),
+		zap.Stringer("childMax", childMax),
+		zap.Stringer("fairShare", fairShare))
+
+	return fairShare
+}
+
+// GetFairSharePreemptableResource computes resources that can be preempted for fair share
+// This considers both guaranteed resources and fair share limits
+func (qps *QueuePreemptionSnapshot) GetFairSharePreemptableResource() *resources.Resource {
+	if qps == nil || qps.AllocatedResource.IsEmpty() {
+		return nil
+	}
+
+	actual := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
+
+	// Get the higher of guaranteed or fair share as the minimum threshold
+	guaranteed := qps.GuaranteedResource
+	fairShare := qps.GetFairShareResource()
+
+	log.Log(log.SchedPreemption).Info("GetFairSharePreemptableResource: calculating preemptable resources",
+		zap.String("queuePath", qps.QueuePath),
+		zap.Stringer("allocatedResource", qps.AllocatedResource),
+		zap.Stringer("preemptingResource", qps.PreemptingResource),
+		zap.Stringer("actual", actual),
+		zap.Stringer("guaranteed", guaranteed),
+		zap.Stringer("fairShare", fairShare))
+
+	var minThreshold *resources.Resource
+	if guaranteed != nil && !guaranteed.IsEmpty() {
+		minThreshold = guaranteed.Clone()
+		if fairShare != nil && !fairShare.IsEmpty() {
+			// Use the higher of guaranteed and fair share
+			for resourceType, quantity := range fairShare.Resources {
+				if existing, exists := minThreshold.Resources[resourceType]; !exists || quantity > existing {
+					minThreshold.Resources[resourceType] = quantity
+				}
+			}
+		}
+	} else if fairShare != nil && !fairShare.IsEmpty() {
+		minThreshold = fairShare.Clone()
+	} else {
+		// No minimum threshold, nothing to preempt
+		log.Log(log.SchedPreemption).Info("GetFairSharePreemptableResource: no minimum threshold (no guaranteed or fair share)",
+			zap.String("queuePath", qps.QueuePath))
+		return nil
+	}
+
+	// Calculate preemptable resource: allocated - min(guaranteed, fair_share)
+	preemptableResource := resources.SubOnlyExisting(actual, minThreshold)
+
+	// Keep only over-allocated resource types
+	for k, v := range preemptableResource.Resources {
+		if v <= 0 {
+			delete(preemptableResource.Resources, k)
+		}
+	}
+
+	log.Log(log.SchedPreemption).Info("GetFairSharePreemptableResource: calculated preemptable resources",
+		zap.String("queuePath", qps.QueuePath),
+		zap.Stringer("minThreshold", minThreshold),
+		zap.Stringer("preemptableResource", preemptableResource))
+
+	return preemptableResource
+}
+
+// getActiveSiblingCount returns the number of sibling queues that have allocations
+// This is a fallback method that returns 0, as the actual count should be calculated
+// at the queue level and passed to GetFairShareResourceWithSiblingCount
+func (qps *QueuePreemptionSnapshot) getActiveSiblingCount() int {
+	// This method is kept for backward compatibility but should not be used
+	// in the new fair share implementation. The actual sibling count should be
+	// calculated at the queue level and passed explicitly.
+	return 0
+}
+
+// getActiveSiblingsGuaranteedSum calculates the sum of guaranteed resources of all active sibling queues
+func (qps *QueuePreemptionSnapshot) getActiveSiblingsGuaranteedSum() *resources.Resource {
+	if qps == nil || qps.Parent == nil {
+		return resources.NewResource()
+	}
+
+	// For now, we'll use a simplified approach: if we can't get the actual sibling information,
+	// we'll assume the parent's guaranteed resources represent the sum of children's guaranteed resources.
+	// This is a limitation of the current snapshot-based approach.
+	parentGuaranteed := qps.Parent.GetGuaranteedResource()
+	if parentGuaranteed == nil {
+		return resources.NewResource()
+	}
+
+	return parentGuaranteed.Clone()
 }
 
 // AddAllocation adds an allocation to this snapshot's resource usage

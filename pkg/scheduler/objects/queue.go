@@ -1770,14 +1770,26 @@ func (sq *Queue) GetPreemptionPolicy() policies.PreemptionPolicy {
 // ask is the ask we are attempting to preempt for
 // return is a map of potential victims keyed by queue path
 func (sq *Queue) FindEligiblePreemptionVictims(queuePath string, ask *Allocation) map[string]*QueuePreemptionSnapshot {
+	log.Log(log.SchedPreemption).Info("FindEligiblePreemptionVictims: called",
+		zap.String("queuePath", sq.QueuePath),
+		zap.String("askQueuePath", queuePath),
+		zap.String("askKey", ask.GetAllocationKey()),
+		zap.String("askPriority", fmt.Sprintf("%d", ask.GetPriority())))
+
 	results := make(map[string]*QueuePreemptionSnapshot)
 	priorityMap := make(map[string]int64)
 
 	// get the queue which acts as the fence boundary
 	fence := sq.findPreemptionFenceRoot(priorityMap, int64(ask.priority))
 	if fence == nil {
+		log.Log(log.SchedPreemption).Info("FindEligiblePreemptionVictims: no fence found, returning nil",
+			zap.String("queuePath", sq.QueuePath))
 		return nil
 	}
+
+	log.Log(log.SchedPreemption).Info("FindEligiblePreemptionVictims: fence found",
+		zap.String("queuePath", sq.QueuePath),
+		zap.String("fencePath", fence.QueuePath))
 
 	// now, starting from the fence, we travel downward (going depth-first) to find victims of equal or lower priority
 	queuePriority, ok := priorityMap[fence.QueuePath]
@@ -1799,7 +1811,109 @@ func (sq *Queue) FindEligiblePreemptionVictims(queuePath string, ask *Allocation
 	// walk the subtree contained within the preemption fence and collect potential victims organized by nodeID
 	fence.findEligiblePreemptionVictims(results, queuePath, ask, priorityMap, queuePriority, false)
 
+	log.Log(log.SchedPreemption).Info("FindEligiblePreemptionVictims: returning results",
+		zap.String("queuePath", sq.QueuePath),
+		zap.Int("resultCount", len(results)))
+
+	for queuePath, snapshot := range results {
+		log.Log(log.SchedPreemption).Info("FindEligiblePreemptionVictims: result entry",
+			zap.String("queuePath", sq.QueuePath),
+			zap.String("resultQueuePath", queuePath),
+			zap.Int("victimCount", len(snapshot.PotentialVictims)))
+	}
+
 	return results
+}
+
+// getActiveSiblingCount returns the number of sibling queues that have guaranteed resources
+func (sq *Queue) getActiveSiblingCount() int {
+	log.Log(log.SchedPreemption).Info("getActiveSiblingCount: called",
+		zap.String("queuePath", sq.QueuePath))
+
+	if sq.parent == nil {
+		log.Log(log.SchedPreemption).Info("getActiveSiblingCount: no parent, returning 0",
+			zap.String("queuePath", sq.QueuePath))
+		return 0
+	}
+
+	activeCount := 0
+	for _, sibling := range sq.parent.GetCopyOfChildren() {
+		if sibling.QueuePath != sq.QueuePath {
+			// Count siblings that have guaranteed resources for fair share calculation
+			log.Log(log.SchedPreemption).Info("getActiveSiblingCount: checking sibling",
+				zap.String("currentQueue", sq.QueuePath),
+				zap.String("siblingQueue", sibling.QueuePath),
+				zap.Stringer("siblingGuaranteed", sibling.guaranteedResource))
+
+			if sibling.guaranteedResource != nil && !sibling.guaranteedResource.IsEmpty() {
+				activeCount++
+				log.Log(log.SchedPreemption).Info("getActiveSiblingCount: counted sibling",
+					zap.String("currentQueue", sq.QueuePath),
+					zap.String("siblingQueue", sibling.QueuePath),
+					zap.Int("activeCount", activeCount))
+			}
+		}
+	}
+
+	// Include self if it has guaranteed resources
+	if sq.guaranteedResource != nil && !sq.guaranteedResource.IsEmpty() {
+		activeCount++
+		log.Log(log.SchedPreemption).Info("getActiveSiblingCount: counted self",
+			zap.String("currentQueue", sq.QueuePath),
+			zap.Stringer("selfGuaranteed", sq.guaranteedResource),
+			zap.Int("finalActiveCount", activeCount))
+	}
+
+	log.Log(log.SchedPreemption).Info("getActiveSiblingCount: final result",
+		zap.String("queuePath", sq.QueuePath),
+		zap.Int("finalActiveCount", activeCount))
+
+	return activeCount
+}
+
+// getActiveSiblingsGuaranteedSum returns the sum of guaranteed resources of all active sibling queues
+func (sq *Queue) getActiveSiblingsGuaranteedSum() *resources.Resource {
+	log.Log(log.SchedPreemption).Info("getActiveSiblingsGuaranteedSum: called",
+		zap.String("queuePath", sq.QueuePath),
+		zap.String("parentPath", sq.parent.QueuePath))
+
+	if sq.parent == nil {
+		log.Log(log.SchedPreemption).Info("getActiveSiblingsGuaranteedSum: no parent, returning empty resource",
+			zap.String("queuePath", sq.QueuePath))
+		return resources.NewResource()
+	}
+
+	sum := resources.NewResource()
+	for _, sibling := range sq.parent.GetCopyOfChildren() {
+		if sibling.QueuePath != sq.QueuePath {
+			// Add this sibling's guaranteed resources to the sum
+			// We include all siblings regardless of allocation status for fair share calculation
+			log.Log(log.SchedPreemption).Info("getActiveSiblingsGuaranteedSum: checking sibling",
+				zap.String("currentQueue", sq.QueuePath),
+				zap.String("siblingQueue", sibling.QueuePath),
+				zap.Stringer("siblingGuaranteed", sibling.guaranteedResource))
+
+			if sibling.guaranteedResource != nil && !sibling.guaranteedResource.IsEmpty() {
+				sum = resources.Add(sum, sibling.guaranteedResource)
+				log.Log(log.SchedPreemption).Info("getActiveSiblingsGuaranteedSum: added sibling guaranteed",
+					zap.String("currentQueue", sq.QueuePath),
+					zap.String("siblingQueue", sibling.QueuePath),
+					zap.Stringer("siblingGuaranteed", sibling.guaranteedResource),
+					zap.Stringer("newSum", sum))
+			} else {
+				log.Log(log.SchedPreemption).Info("getActiveSiblingsGuaranteedSum: skipping sibling - no guaranteed resources",
+					zap.String("currentQueue", sq.QueuePath),
+					zap.String("siblingQueue", sibling.QueuePath),
+					zap.Stringer("siblingGuaranteed", sibling.guaranteedResource))
+			}
+		}
+	}
+
+	log.Log(log.SchedPreemption).Info("getActiveSiblingsGuaranteedSum: final result",
+		zap.String("queuePath", sq.QueuePath),
+		zap.Stringer("finalSum", sum))
+
+	return sum
 }
 
 // createPreemptionSnapshot is used to create a snapshot of the current queue's resource usage and potential preemption victims
@@ -1846,10 +1960,39 @@ func (sq *Queue) findEligiblePreemptionVictims(results map[string]*QueuePreempti
 
 		victims := sq.createPreemptionSnapshot(results, queuePath)
 
-		// skip this queue if we are within guaranteed limits
-		remaining := results[sq.QueuePath].GetRemainingGuaranteedResource()
-		if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
-			return
+		// Check if this queue can be considered for preemption based on policy
+		preemptionPolicy := sq.GetPreemptionPolicy()
+		var preemptableResource *resources.Resource
+
+		log.Log(log.SchedPreemption).Info("Queue preemption policy check",
+			zap.String("queuePath", sq.QueuePath),
+			zap.String("preemptionPolicy", preemptionPolicy.String()))
+
+		if preemptionPolicy == policies.FairSharePreemptionPolicy {
+			// For fair share preemption, calculate actual sibling count and their guaranteed sum
+			activeSiblings := sq.getActiveSiblingCount()
+			siblingsGuaranteedSum := sq.getActiveSiblingsGuaranteedSum()
+			log.Log(log.SchedPreemption).Info("Using fair share preemption policy",
+				zap.String("queuePath", sq.QueuePath),
+				zap.Int("activeSiblings", activeSiblings),
+				zap.Stringer("siblingsGuaranteedSum", siblingsGuaranteedSum))
+			preemptableResource = results[sq.QueuePath].GetPreemptableResourceForFairShareWithGuaranteedSum(activeSiblings, siblingsGuaranteedSum)
+		} else {
+			// For other policies, use standard calculation
+			log.Log(log.SchedPreemption).Info("Using standard preemption policy",
+				zap.String("queuePath", sq.QueuePath),
+				zap.String("policy", preemptionPolicy.String()))
+			preemptableResource = results[sq.QueuePath].GetPreemptableResourceForPolicy(preemptionPolicy)
+		}
+
+		log.Log(log.SchedPreemption).Info("Preemption policy result",
+			zap.String("queuePath", sq.QueuePath),
+			zap.Stringer("preemptableResource", preemptableResource))
+
+		if preemptableResource == nil || preemptableResource.IsEmpty() {
+			log.Log(log.SchedPreemption).Info("No preemptable resources for this policy, skipping queue",
+				zap.String("queuePath", sq.QueuePath))
+			return // No preemptable resources for this policy
 		}
 
 		// walk allocations and select those that are equal or lower than current priority
@@ -1879,13 +2022,31 @@ func (sq *Queue) findEligiblePreemptionVictims(results map[string]*QueuePreempti
 				// otherwise the task is a candidate if its priority is less than or equal to the ask priority
 				if fenced || int64(alloc.GetPriority()) <= askPriority {
 					victims.PotentialVictims = append(victims.PotentialVictims, alloc)
+					log.Log(log.SchedPreemption).Info("Found potential victim for preemption",
+						zap.String("queuePath", sq.QueuePath),
+						zap.String("allocationKey", alloc.GetAllocationKey()),
+						zap.String("allocationPriority", fmt.Sprintf("%d", alloc.GetPriority())),
+						zap.String("askPriority", fmt.Sprintf("%d", askPriority)),
+						zap.Bool("fenced", fenced))
+				} else {
+					log.Log(log.SchedPreemption).Info("Skipping allocation - priority too high",
+						zap.String("queuePath", sq.QueuePath),
+						zap.String("allocationKey", alloc.GetAllocationKey()),
+						zap.String("allocationPriority", fmt.Sprintf("%d", alloc.GetPriority())),
+						zap.String("askPriority", fmt.Sprintf("%d", askPriority)))
 				}
 			}
 		}
 
 		// remove from potential victim list if there are no potential victims
 		if len(victims.PotentialVictims) == 0 {
+			log.Log(log.SchedPreemption).Info("No potential victims found, removing queue from results",
+				zap.String("queuePath", sq.QueuePath))
 			delete(results, sq.QueuePath)
+		} else {
+			log.Log(log.SchedPreemption).Info("Found potential victims",
+				zap.String("queuePath", sq.QueuePath),
+				zap.Int("victimCount", len(victims.PotentialVictims)))
 		}
 	} else {
 		// parent queue, walk child queues and evaluate
