@@ -205,17 +205,16 @@ func (p *Preemptor) checkPreemptionQueueGuarantees() bool {
 			currentQueueObj := p.queue
 			if currentQueueObj != nil && currentQueueObj.GetPreemptionPolicy() == policies.FairSharePreemptionPolicy {
 				// For fair share preemption, we need to check if preemption will help achieve fair share
-				// This means checking if the preemptor queue needs resources (is under-allocated)
+				// This means checking if the preemptor queue is under-allocated
 				// and the victim queue has excess resources (is over-allocated)
 				remaining := currentQueue.GetRemainingFairShareResource()
 
 				// For fair share preemption, check if there are remaining fair share resources
-				// Similar to guaranteed resources, we check if the queue has room within its fair share
+				// Similar to guaranteed resources, we check if the queue has room within its fair share limit
 				if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
 					return true
 				}
 			} else {
-				// For guaranteed-based preemption, use existing logic
 				remaining := currentQueue.GetRemainingGuaranteedResource()
 				if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
 					return true
@@ -293,7 +292,7 @@ func (p *Preemptor) calculateVictimsByNode(nodeAvailable *resources.Resource, po
 					}
 
 					// Did adding this allocation make the ask queue over - utilized?
-					if askQueueNewRemaining != nil && resources.StrictlyGreaterThan(resources.Zero, askQueueNewRemaining) {
+					if askQueueNewRemaining != nil && askQueueNewRemaining.HasNegativeValue() {
 						askQueue.RemoveAllocation(victim.GetAllocatedResource())
 						queueSnapshot.AddAllocation(victim.GetAllocatedResource())
 						break
@@ -545,7 +544,7 @@ func (p *Preemptor) calculateAdditionalVictims(nodeVictims []*Allocation) ([]*Al
 					}
 
 					// Did adding this allocation make the ask queue over - utilized?
-					if askQueueNewRemaining != nil && resources.StrictlyGreaterThan(resources.Zero, askQueueNewRemaining) {
+					if askQueueNewRemaining != nil && askQueueNewRemaining.HasNegativeValue() {
 						askQueue.RemoveAllocation(victim.GetAllocatedResource())
 						queueSnapshot.AddAllocation(victim.GetAllocatedResource())
 						break

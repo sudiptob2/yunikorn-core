@@ -1860,13 +1860,13 @@ func (sq *Queue) findEligiblePreemptionVictims(results map[string]*QueuePreempti
 		var remaining *resources.Resource
 
 		if sq.GetPreemptionPolicy() == policies.FairSharePreemptionPolicy {
-			// For fair share: skip if queue is NOT over-allocated (remaining >= 0)
+			// For fair share: skip if queue is within the fair share limit
 			remaining = results[sq.QueuePath].GetRemainingFairShareResource()
 			if remaining != nil && !remaining.HasNegativeValue() {
-				return // Skip - queue is not over-allocated, no victims to collect
+				return
 			}
 		} else {
-			// For guaranteed preemption: skip if queue is within guaranteed limits
+			// skip this queue if we are within guaranteed limits
 			remaining = results[sq.QueuePath].GetRemainingGuaranteedResource()
 			if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
 				return
