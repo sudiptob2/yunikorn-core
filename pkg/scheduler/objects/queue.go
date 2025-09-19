@@ -1802,6 +1802,16 @@ func (sq *Queue) FindEligiblePreemptionVictims(queuePath string, ask *Allocation
 	return results
 }
 
+// getSiblingCount returns the number of sibling queues (including current queue)
+func (sq *Queue) getSiblingCount() int {
+
+	if sq.parent == nil {
+		return 0
+	}
+
+	return len(sq.parent.GetCopyOfChildren())
+}
+
 // createPreemptionSnapshot is used to create a snapshot of the current queue's resource usage and potential preemption victims
 func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnapshot, askQueuePath string) *QueuePreemptionSnapshot {
 	if sq == nil {
@@ -1826,6 +1836,7 @@ func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnaps
 		GuaranteedResource: sq.guaranteedResource.Clone(),
 		PotentialVictims:   make([]*Allocation, 0),
 		AskQueue:           cache[askQueuePath],
+		Queue:              sq,
 	}
 	cache[sq.QueuePath] = snapshot
 	return snapshot
@@ -1846,10 +1857,20 @@ func (sq *Queue) findEligiblePreemptionVictims(results map[string]*QueuePreempti
 
 		victims := sq.createPreemptionSnapshot(results, queuePath)
 
-		// skip this queue if we are within guaranteed limits
-		remaining := results[sq.QueuePath].GetRemainingGuaranteedResource()
-		if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
-			return
+		var remaining *resources.Resource
+
+		if sq.GetPreemptionPolicy() == policies.FairSharePreemptionPolicy {
+			// For fair share: skip if queue is NOT over-allocated (remaining >= 0)
+			remaining = results[sq.QueuePath].GetRemainingFairShareResource()
+			if remaining != nil && !remaining.HasNegativeValue() {
+				return // Skip - queue is not over-allocated, no victims to collect
+			}
+		} else {
+			// For guaranteed preemption: skip if queue is within guaranteed limits
+			remaining = results[sq.QueuePath].GetRemainingGuaranteedResource()
+			if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
+				return
+			}
 		}
 
 		// walk allocations and select those that are equal or lower than current priority
