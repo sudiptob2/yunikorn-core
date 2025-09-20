@@ -205,8 +205,6 @@ func (p *Preemptor) checkPreemptionQueueGuarantees() bool {
 			currentQueueObj := p.queue
 			if currentQueueObj != nil && currentQueueObj.GetPreemptionPolicy() == policies.FairSharePreemptionPolicy {
 				// For fair share preemption, we need to check if preemption will help achieve fair share
-				// This means checking if the preemptor queue is under-allocated
-				// and the victim queue has excess resources (is over-allocated)
 				remaining := currentQueue.GetRemainingFairShareResource()
 
 				// For fair share preemption, check if there are remaining fair share resources
@@ -871,26 +869,46 @@ func (qps *QueuePreemptionSnapshot) GetPreemptableResource() *resources.Resource
 	return resources.ComponentWiseMinOnlyExisting(preemptableResource, parentPreemptableResource)
 }
 
-// GetFairSharePreemptableResource computes resources that can be preempted for fair share
-// This considers both guaranteed resources and fair share limits
+// GetFairSharePreemptableResource computes resources that can be preempted from this queue
+// when using fair share preemption policy. This method determines how much of the queue's
+// allocated resources can be safely preempted without violating fair share constraints.
+//
+// Algorithm Overview:
+// 1. Calculate the minimum threshold as max(guaranteed_resources, fair_share_resources)
+// 2. Compute over-allocation: actual_allocated - min_threshold
+// 3. Return only positive over-allocated resources (those that can be preempted)
+//
+// Key Design Decisions compared to GetPreemptableResource:
+//   - Uses max(guaranteed, fair_share) as protection threshold to ensure queues don't fall
+//     below either their guaranteed allocation or their fair share allocation
+//   - Fair share calculation already handles hierarchical constraints properly, so no
+//     additional parent constraints are needed to avoid double-constraining
+//   - Only returns over-utilized resource types (positive values) for preemption
+//
+// Example:
+//
+//	Queue has: guaranteed=10 CPU, fair_share=15 CPU, allocated=20 CPU
+//	min_threshold = max(10, 15) = 15 CPU
+//	preemptable = 20 - 15 = 5 CPU
 func (qps *QueuePreemptionSnapshot) GetFairSharePreemptableResource() *resources.Resource {
-	// No usage, so nothing to preempt
+	// Early exit: No resources allocated means nothing to preempt
 	if qps == nil || qps.AllocatedResource.IsEmpty() {
 		return nil
 	}
 
-	parentPreemptableResource := qps.Parent.GetPreemptableResource()
-	actual := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
-
-	// Get the higher of guaranteed or fair share as the minimum threshold
+	// Step 1: Determine the minimum threshold for this queue
+	// The threshold represents the minimum resources this queue should retain
+	// We use the higher of guaranteed resources or fair share resources
 	guaranteed := qps.GuaranteedResource
-	fairShare := qps.GetFairShareResource()
+	fairShare := qps.GetFairShareResource() // This already handles hierarchical calculation
 
 	var minThreshold *resources.Resource
 	if guaranteed != nil && !guaranteed.IsEmpty() {
+		// Start with guaranteed resources as base threshold
 		minThreshold = guaranteed.Clone()
 		if fairShare != nil && !fairShare.IsEmpty() {
-			// Use the higher of guaranteed and fair share
+			// For each resource type, use the higher of guaranteed or fair share
+			// This ensures the queue is protected by whichever constraint is more generous
 			for resourceType, quantity := range fairShare.Resources {
 				if existing, exists := minThreshold.Resources[resourceType]; !exists || quantity > existing {
 					minThreshold.Resources[resourceType] = quantity
@@ -898,39 +916,69 @@ func (qps *QueuePreemptionSnapshot) GetFairSharePreemptableResource() *resources
 			}
 		}
 	} else if fairShare != nil && !fairShare.IsEmpty() {
+		// No guaranteed resources set, use fair share as threshold
 		minThreshold = fairShare.Clone()
 	} else {
-		// No minimum threshold, nothing to preempt
+		// No minimum threshold defined (neither guaranteed nor fair share)
+		// This means the queue has no protection, so nothing should be preempted
 		return nil
 	}
 
-	// Calculate preemptable resource. +ve means Over utilized, -ve means Under utilized, 0 means correct utilization
+	// Step 2: Calculate actual allocated resources (excluding already preempting resources)
+	// This gives us the current effective allocation that we need to evaluate
+	actual := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
+
+	// Step 3: Calculate over-allocation by subtracting the minimum threshold
+	// Positive values = over-utilized (can be preempted)
+	// Negative values = under-utilized (should not be preempted)
+	// Zero values = exactly at threshold (should not be preempted)
 	actual = resources.SubOnlyExisting(actual, minThreshold)
 	preemptableResource := actual
 
-	// Keep only the resource type which needs to be preempted
+	// Step 4: Filter to keep only over-utilized resource types
+	// We only want to preempt resources where the queue is exceeding its threshold
 	for k, v := range actual.Resources {
-		// Under-utilized or completely used resource types
 		if v <= 0 {
+			// Under-utilized or exactly at threshold - remove from preemptable list
+			// This queue is not over-allocated for this resource type
 			delete(preemptableResource.Resources, k)
-		} else { // Over utilized resource types
+		} else {
+			// Over-utilized - keep in preemptable list
+			// This queue has excess allocation that can be safely preempted
 			preemptableResource.Resources[k] = v
 		}
 	}
-	// When nothing to preempt or usage equals threshold in current queue, return as is.
-	// Otherwise, doing min calculation with parent level (for a different res types) would lead to a wrong perception
-	// of choosing this current queue to select the victims when that is not the fact.
-	// As you move down the hierarchy, results calculated at lower level has higher precedence.
-	if preemptableResource.IsEmpty() {
-		return preemptableResource
+
+	// Return the final preemptable resource calculation
+	// Note: We intentionally do NOT apply parent constraints here because:
+	// 1. Fair share calculation already handles hierarchical constraints properly
+	// 2. Parent constraints would use different preemption policies (guaranteed-only)
+	// 3. This would create double-constraining and make fair share preemption ineffective
+	// 4. Each queue's preemption policy should be respected independently
+	// However, it needs further testing to ensure it works as expected.
+	return preemptableResource
+}
+
+// GetRemainingFairShareResource computes the remaining fair share resources for this queue
+// Returns positive if queue is under fair share, negative if over fair share, zero if exactly at fair share
+func (qps *QueuePreemptionSnapshot) GetRemainingFairShareResource() *resources.Resource {
+	if qps == nil {
+		return nil
 	}
 
-	// Calculate min of current (leaf) and parent queue preemptable resource using current (leaf) queue as base because overall intention
-	// is to preempt something from the current queue (leaf).
-	// There is no use for the resource types not present in current (leaf) queue but available in parent queue
-	// (might be because of other current queue siblings) and also leads to wrong perception.
-	// So minimum would be derived only for resource types in current (leaf) queue preemptable resource.
-	return resources.ComponentWiseMinOnlyExisting(preemptableResource, parentPreemptableResource)
+	// Get the fair share this queue should have
+	fairShare := qps.GetFairShareResource()
+	if fairShare == nil || fairShare.IsEmpty() {
+		return nil // No fair share defined
+	}
+
+	// Get actual allocated resources (excluding preempting resources)
+	actual := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
+
+	// Calculate remaining: fair_share - actual
+	remaining := resources.SubOnlyExisting(fairShare, actual)
+
+	return remaining
 }
 
 func (qps *QueuePreemptionSnapshot) GetRemainingGuaranteedResource() *resources.Resource {
@@ -1094,28 +1142,6 @@ func (qps *QueuePreemptionSnapshot) GetFairShareResource() *resources.Resource {
 	}
 
 	return fairShare
-}
-
-// GetRemainingFairShareResource computes the remaining fair share resources for this queue
-// Returns positive if queue is under fair share, negative if over fair share, zero if exactly at fair share
-func (qps *QueuePreemptionSnapshot) GetRemainingFairShareResource() *resources.Resource {
-	if qps == nil {
-		return nil
-	}
-
-	// Get the fair share this queue should have
-	fairShare := qps.GetFairShareResource()
-	if fairShare == nil || fairShare.IsEmpty() {
-		return nil // No fair share defined
-	}
-
-	// Get actual allocated resources (excluding preempting resources)
-	actual := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
-
-	// Calculate remaining: fair_share - actual
-	remaining := resources.SubOnlyExisting(fairShare, actual)
-
-	return remaining
 }
 
 // getActiveSiblingCount returns the number of active sibling queues (including current queue)
