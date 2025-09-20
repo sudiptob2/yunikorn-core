@@ -959,26 +959,49 @@ func (qps *QueuePreemptionSnapshot) GetFairSharePreemptableResource() *resources
 	return preemptableResource
 }
 
-// GetRemainingFairShareResource computes the remaining fair share resources for this queue
-// Returns positive if queue is under fair share, negative if over fair share, zero if exactly at fair share
+// GetRemainingFairShareResource computes the remaining fair share resources for this queue.
+// This method calculates how much more or less resources this queue has compared to its
+// calculated fair share allocation.
+//
+// Return values:
+//   - Positive value: Queue is under its fair share (can receive more resources)
+//   - Negative value: Queue is over its fair share (may need to release resources)
+//   - Zero value: Queue is exactly at its fair share
+//   - nil: No fair share is defined for this queue or queue snapshot is nil
+//
+// The calculation follows the formula: remaining = fair_share - actual_allocated
+// where actual_allocated excludes resources currently being preempted.
+// Note: Unlike GetRemainingGuaranteedResource(), I did not take parent's fair share into account
+// because GetFairShareResource() calculation should already handle hierarchical constraints.
+// This might need to be revisited in the future.
 func (qps *QueuePreemptionSnapshot) GetRemainingFairShareResource() *resources.Resource {
+	// Handle nil queue snapshot case
 	if qps == nil {
 		return nil
 	}
 
-	// Get the fair share this queue should have
-	fairShare := qps.GetFairShareResource()
-	if fairShare == nil || fairShare.IsEmpty() {
-		return nil // No fair share defined
+	// Calculate the fair share amount this queue should receive based on:
+	// - Total cluster capacity (for root queue)
+	// - Parent's fair share divided among active siblings (for child queues)
+	// - Hierarchical fair share policies
+	remainingFairShare := qps.GetFairShareResource()
+	if remainingFairShare == nil || remainingFairShare.IsEmpty() {
+		// No fair share is defined for this queue, return nil to indicate
+		// that fair share calculation is not applicable
+		return nil
 	}
 
-	// Get actual allocated resources (excluding preempting resources)
-	actual := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
+	// Calculate the actual allocated resources excluding those currently being preempted.
+	// This represents the "stable" resource allocation that should be considered
+	// for fair share calculations, as preempting resources are transient.
+	used := resources.SubOnlyExisting(qps.AllocatedResource, qps.PreemptingResource)
 
-	// Calculate remaining: fair_share - actual
-	remaining := resources.SubOnlyExisting(fairShare, actual)
+	// Calculate remaining fair share: fair_share - used
+	// SubOnlyExisting ensures we only subtract resource types that exist in remainingFairShare,
+	// ignoring any resource types that might exist in used but not in fair share
+	remainingFairShare = resources.SubOnlyExisting(remainingFairShare, used)
 
-	return remaining
+	return remainingFairShare
 }
 
 func (qps *QueuePreemptionSnapshot) GetRemainingGuaranteedResource() *resources.Resource {
