@@ -986,42 +986,111 @@ func (qps *QueuePreemptionSnapshot) GetMaxResource() *resources.Resource {
 	return resources.ComponentWiseMin(qps.Parent.GetMaxResource(), qps.MaxResource)
 }
 
+// GetTotalChildAllocation computes the total allocated resources across all child queues
+func (qps *QueuePreemptionSnapshot) GetTotalChildAllocation() *resources.Resource {
+	if qps == nil || qps.Queue == nil {
+		return resources.NewResource()
+	}
+
+	// Sum up all direct child allocations
+	totalChildAllocation := resources.NewResource()
+
+	// Get a copy of all child queues and iterate through them
+	childQueues := qps.Queue.GetCopyOfChildren()
+	for _, childQueue := range childQueues {
+		if childQueue != nil {
+			// Get the child's allocated resource (excluding preempting resources)
+			childAllocated := resources.SubOnlyExisting(childQueue.GetAllocatedResource(), childQueue.GetPreemptingResource())
+			totalChildAllocation.AddTo(childAllocated)
+		}
+	}
+
+	return totalChildAllocation
+}
+
 // GetFairShareResource computes the fair share of resources for this queue
+// For nested queues: fair share = parent's fair share / active siblings
+// For root queue: fair share = total capacity / active children (if any)
 func (qps *QueuePreemptionSnapshot) GetFairShareResource() *resources.Resource {
-	if qps == nil || qps.Parent == nil {
+	if qps == nil {
+		return nil
+	}
+	currentQueue := qps
+	if currentQueue.Parent == nil || currentQueue.Parent.Queue.GetPreemptionPolicy() != policies.FairSharePreemptionPolicy {
+		// Base Case: Root queue or not fair share preemption policy for the parent queue
+		// get total children allocation
+		// divide by active children
+		// Apply bounds: fair_share = min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+
+		activeChildren := currentQueue.getActiveSiblingCount()
+
+		// For root queue, fair share = max_resource / active_children
+		totalAllocation := currentQueue.GetTotalChildAllocation()
+
+		if totalAllocation.IsEmpty() {
+			return nil
+		}
+
+		if activeChildren <= 0 {
+			return totalAllocation.Clone()
+		}
+
+		fairShare := totalAllocation.Clone()
+		for resourceType, quantity := range fairShare.Resources {
+			if quantity > 0 {
+				fairShare.Resources[resourceType] = quantity / resources.Quantity(activeChildren)
+			}
+		}
+
+		// Apply bounds: fair_share = min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+		currentQueueMax := currentQueue.GetMaxResource()
+		currentQueueGuaranteed := currentQueue.GetGuaranteedResource()
+
+		// max(fair_share, currentQueue_guaranteed)
+		if currentQueueGuaranteed != nil && !currentQueueGuaranteed.IsEmpty() {
+			fairShare = resources.ComponentWiseMax(fairShare, currentQueueGuaranteed)
+		}
+
+		// min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+		if currentQueueMax != nil && !currentQueueMax.IsEmpty() {
+			fairShare = resources.ComponentWiseMin(fairShare, currentQueueMax)
+		}
+
+		return fairShare
+	}
+
+	// Case 1: Queue has a parent - inherit fair share from parent
+	parentFairShare := currentQueue.Parent.GetFairShareResource()
+	if parentFairShare == nil || parentFairShare.IsEmpty() {
 		return nil
 	}
 
-	// Get parent's available capacity (max - sum of children's guaranteed)
-	parentCapacity := qps.Parent.GetMaxResource()
-	if parentCapacity == nil || parentCapacity.IsEmpty() {
-		return nil
+	activeSiblings := currentQueue.getActiveSiblingCount()
+	if activeSiblings <= 0 {
+		// If only no active sibling, inherit parent's full fair share
+		return parentFairShare.Clone()
 	}
 
-	// childrenGuaranteedSum := qps.getActiveSiblingsGuaranteedSum()
-
-	// parentCapacity := resources.SubOnlyExisting(parentMax, childrenGuaranteedSum)
-	// if parentCapacity == nil || parentCapacity.IsEmpty() {
-	// 	return nil
-	// }
-	activeSiblings := qps.getSiblingCount()
-
-	if activeSiblings <= 1 {
-		return nil // No fair share needed if only one active queue
-	}
-
-	// Calculate fair share: parent_capacity / active_siblings
-	fairShare := parentCapacity.Clone()
+	// Calculate fair share: parent_fair_share / active_siblings
+	fairShare := parentFairShare.Clone()
 	for resourceType, quantity := range fairShare.Resources {
 		if quantity > 0 {
 			fairShare.Resources[resourceType] = quantity / resources.Quantity(activeSiblings)
 		}
 	}
 
-	// Cap fair share to the child's max resources to respect queue limits
-	childMax := qps.GetMaxResource()
-	if childMax != nil && !childMax.IsEmpty() {
-		fairShare = resources.ComponentWiseMin(fairShare, childMax)
+	// Apply bounds: fair_share = min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+	currentQueueMax := currentQueue.GetMaxResource()
+	currentQueueGuaranteed := currentQueue.GetGuaranteedResource()
+
+	// max(fair_share, currentQueue_guaranteed)
+	if currentQueueGuaranteed != nil && !currentQueueGuaranteed.IsEmpty() {
+		fairShare = resources.ComponentWiseMax(fairShare, currentQueueGuaranteed)
+	}
+
+	// min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+	if currentQueueMax != nil && !currentQueueMax.IsEmpty() {
+		fairShare = resources.ComponentWiseMin(fairShare, currentQueueMax)
 	}
 
 	return fairShare
@@ -1049,12 +1118,36 @@ func (qps *QueuePreemptionSnapshot) GetRemainingFairShareResource() *resources.R
 	return remaining
 }
 
-// getSiblingCount returns the number of sibling queues
-func (qps *QueuePreemptionSnapshot) getSiblingCount() int {
-	if qps == nil || qps.Queue == nil {
+// getActiveSiblingCount returns the number of active sibling queues (including current queue)
+// An active sibling is one that has allocated resources or is actively using resources
+func (qps *QueuePreemptionSnapshot) getActiveSiblingCount() int {
+	if qps == nil || qps.Queue == nil || qps.Queue.parent == nil {
 		return 0
 	}
-	return qps.Queue.getSiblingCount()
+
+	activeSiblings := 0
+	childQueues := qps.Queue.parent.GetCopyOfChildren()
+
+	for _, childQueue := range childQueues {
+		if childQueue != nil {
+			// Check if the child queue has allocated resources
+			allocated := childQueue.GetAllocatedResource()
+			hasAllocatedResources := allocated != nil && !allocated.IsEmpty()
+
+			// Check if the child queue has pending resources (applications waiting to be scheduled)
+			pendingResources := childQueue.GetPendingResource()
+			hasPendingResources := pendingResources != nil && !pendingResources.IsEmpty()
+
+			// Count as active if:
+			// 1. Has allocated resources, OR
+			// 2. Has pending resources
+			if hasAllocatedResources || hasPendingResources {
+				activeSiblings++
+			}
+		}
+	}
+
+	return activeSiblings
 }
 
 // AddAllocation adds an allocation to this snapshot's resource usage

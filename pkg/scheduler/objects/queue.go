@@ -1802,16 +1802,6 @@ func (sq *Queue) FindEligiblePreemptionVictims(queuePath string, ask *Allocation
 	return results
 }
 
-// getSiblingCount returns the number of sibling queues (including current queue)
-func (sq *Queue) getSiblingCount() int {
-
-	if sq.parent == nil {
-		return 0
-	}
-
-	return len(sq.parent.GetCopyOfChildren())
-}
-
 // createPreemptionSnapshot is used to create a snapshot of the current queue's resource usage and potential preemption victims
 func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnapshot, askQueuePath string) *QueuePreemptionSnapshot {
 	if sq == nil {
