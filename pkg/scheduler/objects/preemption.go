@@ -1079,50 +1079,73 @@ func (qps *QueuePreemptionSnapshot) GetTotalChildAllocation() *resources.Resourc
 	return totalChildAllocation
 }
 
-// GetFairShareResource computes the fair share of resources for this queue
-// For nested queues: fair share = parent's fair share / active siblings
-// For root queue: fair share = total capacity / active children (if any)
+// GetFairShareResource computes the fair share of resources for this queue.
+// This method implements a hierarchical fair share calculation algorithm that ensures
+// equitable resource distribution across the queue hierarchy.
+//
+// Fair Share Calculation Logic:
+// 1. For root queues: fair_share = total_allocation / active_siblings
+// 2. For child queues: fair_share = parent_fair_share / active_siblings
+// 3. Apply bounds: fair_share = min(queue_max, max(calculated_fair_share, queue_guaranteed))
+//
+// Returns nil if no fair share can be calculated (no resources, no active queues, etc.)
 func (qps *QueuePreemptionSnapshot) GetFairShareResource() *resources.Resource {
+	// Handle nil queue snapshot case
 	if qps == nil {
 		return nil
 	}
+
 	currentQueue := qps
+
+	// Check if this is a base case: root queue or parent doesn't use fair share preemption
+	// This determines whether we calculate fair share from cluster capacity or inherit from parent
 	if currentQueue.Parent == nil || currentQueue.Parent.Queue.GetPreemptionPolicy() != policies.FairSharePreemptionPolicy {
-		// Base Case: Root queue or not fair share preemption policy for the parent queue
-		// get total children allocation
-		// divide by active children
-		// Apply bounds: fair_share = min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+		// BASE CASE: Root queue or parent queue doesn't use fair share preemption policy
+		// In this case, we calculate fair share based on the total available resources
+		// divided among active child queues at this level.
 
-		activeChildren := currentQueue.getActiveSiblingCount()
+		// Get the count of active sibling queues at this level
+		// Active siblings include queues that have allocated resources or are actively using resources
+		activeSiblings := currentQueue.getActiveSiblingCount()
 
-		// For root queue, fair share = max_resource / active_children
+		// Get the total allocation across all child queues to determine available capacity
+		// This represents the total resources that can be fairly distributed
 		totalAllocation := currentQueue.GetTotalChildAllocation()
 
+		// If no resources are allocated to children, there's nothing to distribute
 		if totalAllocation.IsEmpty() {
 			return nil
 		}
 
-		if activeChildren <= 0 {
+		// If no active siblings, return the full allocation to this queue
+		// This handles the case where this queue is the only active one
+		if activeSiblings <= 0 {
 			return totalAllocation.Clone()
 		}
 
+		// Calculate base fair share: total_allocation / active_siblings
+		// This gives each active queue an equal share of the available resources
 		fairShare := totalAllocation.Clone()
 		for resourceType, quantity := range fairShare.Resources {
 			if quantity > 0 {
-				fairShare.Resources[resourceType] = quantity / resources.Quantity(activeChildren)
+				// Divide each resource type equally among active siblings
+				fairShare.Resources[resourceType] = quantity / resources.Quantity(activeSiblings)
 			}
 		}
 
-		// Apply bounds: fair_share = min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+		// Apply resource bounds to ensure fair share respects queue constraints
+		// The formula is: fair_share = min(queue_max, max(calculated_fair_share, queue_guaranteed))
 		currentQueueMax := currentQueue.GetMaxResource()
 		currentQueueGuaranteed := currentQueue.GetGuaranteedResource()
 
-		// max(fair_share, currentQueue_guaranteed)
+		// First bound: Ensure fair share is at least the guaranteed amount
+		// This prevents queues from getting less than their guaranteed resources
 		if currentQueueGuaranteed != nil && !currentQueueGuaranteed.IsEmpty() {
 			fairShare = resources.ComponentWiseMax(fairShare, currentQueueGuaranteed)
 		}
 
-		// min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+		// Second bound: Ensure fair share doesn't exceed the maximum allowed
+		// This prevents queues from getting more than their configured maximum
 		if currentQueueMax != nil && !currentQueueMax.IsEmpty() {
 			fairShare = resources.ComponentWiseMin(fairShare, currentQueueMax)
 		}
@@ -1130,36 +1153,45 @@ func (qps *QueuePreemptionSnapshot) GetFairShareResource() *resources.Resource {
 		return fairShare
 	}
 
-	// Case 1: Queue has a parent - inherit fair share from parent
+	// RECURSIVE CASE: Queue has a parent that uses fair share preemption policy
+	// In this case, we inherit fair share from the parent and divide it among siblings
+
+	// Get the parent's fair share, which serves as our total available resources
 	parentFairShare := currentQueue.Parent.GetFairShareResource()
 	if parentFairShare == nil || parentFairShare.IsEmpty() {
+		// If parent has no fair share, we can't calculate one either
 		return nil
 	}
 
+	// Count active siblings at the same level (including this queue)
+	// This determines how many ways we need to split the parent's fair share
 	activeSiblings := currentQueue.getActiveSiblingCount()
 	if activeSiblings <= 0 {
-		// If only no active sibling, inherit parent's full fair share
+		// If no active siblings, this queue gets the parent's full fair share
 		return parentFairShare.Clone()
 	}
 
 	// Calculate fair share: parent_fair_share / active_siblings
+	// Each active sibling gets an equal portion of the parent's fair share
 	fairShare := parentFairShare.Clone()
 	for resourceType, quantity := range fairShare.Resources {
 		if quantity > 0 {
+			// Divide each resource type equally among active siblings
 			fairShare.Resources[resourceType] = quantity / resources.Quantity(activeSiblings)
 		}
 	}
 
-	// Apply bounds: fair_share = min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+	// Apply the same resource bounds as in the base case
+	// This ensures the inherited fair share respects this queue's constraints
 	currentQueueMax := currentQueue.GetMaxResource()
 	currentQueueGuaranteed := currentQueue.GetGuaranteedResource()
 
-	// max(fair_share, currentQueue_guaranteed)
+	// Ensure fair share meets guaranteed minimum
 	if currentQueueGuaranteed != nil && !currentQueueGuaranteed.IsEmpty() {
 		fairShare = resources.ComponentWiseMax(fairShare, currentQueueGuaranteed)
 	}
 
-	// min(currentQueue_max, max(fair_share, currentQueue_guaranteed))
+	// Ensure fair share doesn't exceed maximum allowed
 	if currentQueueMax != nil && !currentQueueMax.IsEmpty() {
 		fairShare = resources.ComponentWiseMin(fairShare, currentQueueMax)
 	}
