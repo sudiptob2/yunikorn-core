@@ -1071,10 +1071,13 @@ func (qps *QueuePreemptionSnapshot) GetFairShareResource() *resources.Resource {
 
 	currentQueue := qps
 
-	// Check if this is a base case: root queue or parent doesn't use fair share preemption
+	// Check if this is a base case: root queue only
 	// This determines whether we calculate fair share from cluster capacity or inherit from parent
-	if currentQueue.Parent == nil || currentQueue.Parent.Queue.GetPreemptionPolicy() != policies.FairSharePreemptionPolicy {
-		// BASE CASE: Root queue or parent queue doesn't use fair share preemption policy
+	//
+	// NOTE: We calculate fair share all the way to the root for consistency across the hierarchy.
+	// TODO: Monitor performance impact of deeper recursion and consider optimization if needed.
+	if currentQueue.Parent == nil {
+		// BASE CASE: Root queue only
 		// In this case, we calculate fair share based on the total available resources
 		// divided among active child queues at this level.
 
@@ -1135,7 +1138,7 @@ func (qps *QueuePreemptionSnapshot) GetFairShareResource() *resources.Resource {
 		return fairShare
 	}
 
-	// RECURSIVE CASE: Queue has a parent that uses fair share preemption policy
+	// RECURSIVE CASE: Queue has a parent (non-root queue)
 	// In this case, we inherit fair share from the parent and divide it among siblings
 
 	// Get the parent's fair share, which serves as our total available resources
