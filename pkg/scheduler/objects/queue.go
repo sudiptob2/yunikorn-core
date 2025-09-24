@@ -1826,6 +1826,7 @@ func (sq *Queue) createPreemptionSnapshot(cache map[string]*QueuePreemptionSnaps
 		GuaranteedResource: sq.guaranteedResource.Clone(),
 		PotentialVictims:   make([]*Allocation, 0),
 		AskQueue:           cache[askQueuePath],
+		Queue:              sq,
 	}
 	cache[sq.QueuePath] = snapshot
 	return snapshot
@@ -1846,10 +1847,20 @@ func (sq *Queue) findEligiblePreemptionVictims(results map[string]*QueuePreempti
 
 		victims := sq.createPreemptionSnapshot(results, queuePath)
 
-		// skip this queue if we are within guaranteed limits
-		remaining := results[sq.QueuePath].GetRemainingGuaranteedResource()
-		if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
-			return
+		var remaining *resources.Resource
+
+		if sq.GetPreemptionPolicy() == policies.FairSharePreemptionPolicy {
+			// For fair share: skip if queue is within the fair share limit
+			remaining = results[sq.QueuePath].GetRemainingFairShareResource()
+			if remaining != nil && !remaining.HasNegativeValue() {
+				return
+			}
+		} else {
+			// skip this queue if we are within guaranteed limits
+			remaining = results[sq.QueuePath].GetRemainingGuaranteedResource()
+			if remaining != nil && resources.StrictlyGreaterThanOrEquals(remaining, resources.Zero) {
+				return
+			}
 		}
 
 		// walk allocations and select those that are equal or lower than current priority

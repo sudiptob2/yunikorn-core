@@ -26,13 +26,14 @@ import (
 type PreemptionPolicy int
 
 const (
-	DefaultPreemptionPolicy  PreemptionPolicy = iota // preemption is allowed globally
-	FencePreemptionPolicy                            // preemption is allowed only within queue subtree
-	DisabledPreemptionPolicy                         // preemption is disabled
+	DefaultPreemptionPolicy   PreemptionPolicy = iota // preemption is allowed globally
+	FencePreemptionPolicy                             // preemption is allowed only within queue subtree
+	DisabledPreemptionPolicy                          // preemption is disabled
+	FairSharePreemptionPolicy                         // fair share preemption within parent capacity
 )
 
 func (p PreemptionPolicy) String() string {
-	return [...]string{"default", "fence", "disabled"}[p]
+	return [...]string{"default", "fence", "disabled", "fairshare"}[p]
 }
 
 func PreemptionPolicyFromString(str string) (PreemptionPolicy, error) {
@@ -43,6 +44,8 @@ func PreemptionPolicyFromString(str string) (PreemptionPolicy, error) {
 		return FencePreemptionPolicy, nil
 	case DisabledPreemptionPolicy.String():
 		return DisabledPreemptionPolicy, nil
+	case FairSharePreemptionPolicy.String():
+		return FairSharePreemptionPolicy, nil
 	default:
 		return DefaultPreemptionPolicy, fmt.Errorf("undefined preemption.policy: %s", str)
 	}
